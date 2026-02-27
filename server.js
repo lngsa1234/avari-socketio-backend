@@ -6,6 +6,7 @@ const http = require('http');
 const socketIO = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+const WebSocket = require('ws');
 require('dotenv').config();
 
 const app = express();
@@ -54,6 +55,9 @@ const socketToUser = new Map(); // socketId -> userId
 
 // Match metadata
 const matchMetadata = new Map(); // matchId -> { createdAt, lastActivity }
+
+// Deepgram transcription connections
+const deepgramConnections = new Map(); // socketId -> WebSocket instance
 
 // ================================================
 // HTTP ENDPOINTS
@@ -401,12 +405,107 @@ io.on('connection', (socket) => {
   });
 
   // ================================================
+  // DEEPGRAM TRANSCRIPTION PROXY
+  // ================================================
+
+  socket.on('transcription:start', ({ language } = {}) => {
+    try {
+      const apiKey = process.env.DEEPGRAM_API_KEY;
+      if (!apiKey) {
+        socket.emit('transcription:error', { message: 'DEEPGRAM_API_KEY not configured on server' });
+        return;
+      }
+
+      // Close any existing Deepgram connection for this socket
+      const existing = deepgramConnections.get(socket.id);
+      if (existing) {
+        try { existing.close(); } catch (e) { /* ignore */ }
+        deepgramConnections.delete(socket.id);
+      }
+
+      const lang = language || 'en-US';
+      const dgUrl = `wss://api.deepgram.com/v1/listen?model=nova-2&language=${lang}&punctuate=true&interim_results=true&smart_format=true&encoding=linear16&sample_rate=16000&channels=1`;
+
+      console.log(`[Deepgram] Opening connection for socket ${socket.id}, language: ${lang}`);
+
+      const dgWs = new WebSocket(dgUrl, {
+        headers: {
+          Authorization: `Token ${apiKey}`,
+        },
+      });
+
+      deepgramConnections.set(socket.id, dgWs);
+
+      dgWs.on('open', () => {
+        console.log(`[Deepgram] Connection opened for socket ${socket.id}`);
+        socket.emit('transcription:ready');
+      });
+
+      dgWs.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          const transcript = msg?.channel?.alternatives?.[0]?.transcript;
+          if (!transcript) return;
+
+          socket.emit('transcription:result', {
+            text: transcript,
+            isFinal: msg.is_final === true,
+            timestamp: Date.now(),
+          });
+        } catch (e) {
+          console.warn('[Deepgram] Failed to parse message:', e.message);
+        }
+      });
+
+      dgWs.on('close', (code, reason) => {
+        const reasonStr = reason?.toString() || '';
+        console.log(`[Deepgram] Connection closed for socket ${socket.id}, code: ${code}, reason: ${reasonStr}`);
+        deepgramConnections.delete(socket.id);
+        socket.emit('transcription:closed', { code, reason: reasonStr });
+      });
+
+      dgWs.on('error', (err) => {
+        console.error(`[Deepgram] WebSocket error for socket ${socket.id}:`, err.message);
+        socket.emit('transcription:error', { message: err.message });
+      });
+
+    } catch (error) {
+      console.error('[Avari] Error in transcription:start:', error);
+      socket.emit('transcription:error', { message: 'Failed to start transcription' });
+    }
+  });
+
+  socket.on('audio-chunk', (data) => {
+    const dgWs = deepgramConnections.get(socket.id);
+    if (dgWs && dgWs.readyState === WebSocket.OPEN) {
+      dgWs.send(Buffer.from(data));
+    }
+  });
+
+  socket.on('transcription:stop', () => {
+    console.log(`[Deepgram] Stop requested for socket ${socket.id}`);
+    const dgWs = deepgramConnections.get(socket.id);
+    if (dgWs) {
+      try { dgWs.close(); } catch (e) { /* ignore */ }
+      deepgramConnections.delete(socket.id);
+    }
+  });
+
+  // ================================================
   // DISCONNECT HANDLING
   // ================================================
 
   socket.on('disconnect', (reason) => {
     try {
       console.log(`[Avari] Client disconnected: ${socket.id}, reason: ${reason}`);
+
+      // Clean up Deepgram connection
+      const dgWs = deepgramConnections.get(socket.id);
+      if (dgWs) {
+        try { dgWs.close(); } catch (e) { /* ignore */ }
+        deepgramConnections.delete(socket.id);
+        console.log(`[Deepgram] Cleaned up connection for disconnected socket ${socket.id}`);
+      }
 
       if (socket.userId) {
         // Remove from user maps
@@ -420,12 +519,12 @@ io.on('connection', (socket) => {
             match.delete(socket);
 
             // Notify other participants
-            socket.to(socket.matchId).emit('user-left', { 
-              userId: socket.userId 
+            socket.to(socket.matchId).emit('user-left', {
+              userId: socket.userId
             });
 
-            socket.to(socket.matchId).emit('call-ended', { 
-              from: socket.userId 
+            socket.to(socket.matchId).emit('call-ended', {
+              from: socket.userId
             });
 
             // Clean up empty matches
@@ -488,6 +587,7 @@ server.listen(PORT, () => {
   console.log('Services:');
   console.log(`   📡 WebRTC Signaling: ✓`);
   console.log(`   🔄 TURN Server: ${process.env.METERED_USERNAME || process.env.TURN_SERVER_URL ? '✓' : '✗'}`);
+  console.log(`   🎙️ Deepgram Transcription: ${process.env.DEEPGRAM_API_KEY ? '✓' : '✗'}`);
   console.log(`   🔌 Socket.IO: ✓`);
   console.log('============================================');
   console.log('Endpoints:');
